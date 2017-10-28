@@ -2,22 +2,21 @@
 #include <linux/module.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/proc_fs.h>
+#include <linux/time.h>
 #include <linux/timer.h>
 #include <net/ip.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
+#include <linux/moduleparam.h>
 
-#ifdef DEBUG
-#define DVERSTR "d"
-#define DBUILDSTR "Debug "
-#else
-#define DVERSTR ""
-#define DBUILDSTR ""
-#endif
+#define THE_CURRENT_TIME (CURRENT_TIME.tv_sec)
+
+//#define KBUILD_BASENAME	aibmod
+//#define KBUILD_MODNAME	cif
 
 /* Version Info */
-#define VERSION		"1.11" DVERSTR
-#define VERSIONINFO	"CIF v" VERSION " - " DBUILDSTR "Build " __TIME__ " " __DATE__
+#define VERSION		"1.21"
+#define VERSIONINFO	"CIF v" VERSION " - Build " __TIME__ " " __DATE__
 
 /* Time update frequency, doh */
 #define TIMEUPDATEFREQ	10
@@ -27,7 +26,8 @@
 
 /* Various strings */
 #define MSGHEADER		"cif - "
-#define PROCFILENAME	"aibgrebulon"
+#define CONTROLFILENAME	"aibgrebulon"
+#define EXPORTFILENAME	"cif_export"
 
 /* Table Header (hmm?) */
 #define TABLEHEADER		" _#_   ___Source IP___   SPort   ____Dest IP____   DPort   ____ID____   Prt   Last Seen_\n ---------------------------------------------------------------------------------------\n"
@@ -42,11 +42,11 @@
 #define TIMEOUT_MAX		600
 
 #define RULES_MIN		10
-#define RULES_DEFAULT	50
-#define RULES_MAX		200
+#define RULES_DEFAULT	200
+#define RULES_MAX		512
 
 #define PORTS_MIN		1
-#define PORTS_DEFAULT	20
+#define PORTS_DEFAULT	16
 #define PORTS_MAX		32
 
 #define MAXPARAMS		7
@@ -57,7 +57,6 @@
 #define IRF_PERMANENT	0x02
 #define IRF_SPORTFIRST	0x04
 #define IRF_SPORTANY	0x08
-#define IRF_REPORT		0x80
 
 /* PortRule flags */
 #define PRF_ENABLED		0x01
@@ -76,8 +75,9 @@ static unsigned int moduleHook(unsigned int hooknum, struct sk_buff **skb, const
 static void timerCheckHz(unsigned long unused);
 static void timerCheck(unsigned long unused);
 static void ctlRule(int ruleNum, int whattodo);
-static int module_proc_read(char *page, char **start, off_t off, int count, int *eof, void *data);
-static int module_proc_write(struct file *file, const char *buffer, unsigned long count, void *data);
+static int proc_control_read(char *page, char **start, off_t off, int count, int *eof, void *data);
+static int proc_control_write(struct file *file, const char *buffer, unsigned long count, void *data);
+static int proc_export_read(char *page, char **start, off_t off, int count, int *eof, void *data);
 static int match_port_rule(__u16 port, __u32 ip);
 static int add_port_rule(__u16 port, __u32 ip);
 static int remove_port_rule(__u16 port, __u32 ip);
@@ -117,18 +117,20 @@ typedef struct {
 } PortRule;
 
 /* Firewall rules */
-static short maxrules = RULES_DEFAULT;
-static short maxports = PORTS_DEFAULT;
-static short ruletimeout = TIMEOUT_DEFAULT;
+static uint maxrules = RULES_DEFAULT;
+static uint maxports = PORTS_DEFAULT;
+static uint ruletimeout = TIMEOUT_DEFAULT;
 
 /* Insert-time parameters */
-MODULE_PARM(maxrules, "h");
-MODULE_PARM(maxports, "h");
-MODULE_PARM(ruletimeout, "h");
+module_param(maxrules, uint, 0);
+module_param(maxports, uint, 0);
+module_param(ruletimeout, uint, 0);
 
 /* Global variables */
 static IPRule	*iprules;
 static PortRule	*portrules;
+
+static int debugmode;
 
 static struct timer_list timerEntry;
 
@@ -136,11 +138,13 @@ static struct timer_list timerHz; /* HZCHECK */
 static time_t hz_currentTime = 0; /* HZCHECK */
 static unsigned long currentHz = HZ; /* HZCHECK */
 
-static struct proc_dir_entry *procfile;
+static struct proc_dir_entry *controlfile;
+static struct proc_dir_entry *exportfile;
 
 static struct nf_hook_ops hookops = {
 	{ NULL, NULL },
-	moduleHook,
+	(nf_hookfn *) moduleHook,
+	THIS_MODULE,
 	PF_INET,
 	NF_IP_LOCAL_IN,
 	NF_IP_PRI_CONNTRACK
@@ -152,6 +156,7 @@ static unsigned int moduleHook(unsigned int hooknum,
 						const struct net_device *out,
 						int (*okfn)(struct sk_buff *))
 {
+/* How I _LOVE_ macros! */
 #define SKB		(*skb)
 #define IPH		(SKB->nh.iph)
 #define TCPH	((struct tcphdr *) (SKB->data + (IPH->ihl << 2)))
@@ -183,7 +188,7 @@ static unsigned int moduleHook(unsigned int hooknum,
 			if ((CURRULE.flags & IRF_ENABLED) && (CURRULE.protocol == KPROTOCOL_TCP))
 				if (CURRULE.flags & IRF_SPORTANY)
 					if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == tdport)) {
-						CURRULE.lastseen = CURRENT_TIME;
+						CURRULE.lastseen = THE_CURRENT_TIME;
 						return NF_ACCEPT;
 					}
 		}
@@ -191,7 +196,7 @@ static unsigned int moduleHook(unsigned int hooknum,
 		for(i=0; i<maxrules; ++i) { /* Loop 2: See if a latched rule exists */
 			if ((CURRULE.flags & IRF_ENABLED) && (CURRULE.protocol == KPROTOCOL_TCP))
 				if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.src_port == tsport) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == tdport)) {
-					CURRULE.lastseen = CURRENT_TIME;
+					CURRULE.lastseen = THE_CURRENT_TIME;
 					return NF_ACCEPT;
 				}
 		}
@@ -201,7 +206,7 @@ static unsigned int moduleHook(unsigned int hooknum,
 				if ((CURRULE.flags & IRF_SPORTFIRST) && !CURRULE.src_port)
 					if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == tdport)) {
 						CURRULE.src_port = tsport;
-						CURRULE.lastseen = CURRENT_TIME;
+						CURRULE.lastseen = THE_CURRENT_TIME;
 						return NF_ACCEPT;
 					}
 		}
@@ -217,7 +222,7 @@ static unsigned int moduleHook(unsigned int hooknum,
 			if ((CURRULE.flags & IRF_ENABLED) && (CURRULE.protocol == KPROTOCOL_UDP))
 				if (CURRULE.flags & IRF_SPORTANY)
 					if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == udport)) {
-						CURRULE.lastseen = CURRENT_TIME;
+						CURRULE.lastseen = THE_CURRENT_TIME;
 						return NF_ACCEPT;
 					}
 		}
@@ -225,7 +230,7 @@ static unsigned int moduleHook(unsigned int hooknum,
 		for(i=0; i<maxrules; ++i) { /* Loop 2: See if a latched rule exists */
 			if ((CURRULE.flags & IRF_ENABLED) && (CURRULE.protocol == KPROTOCOL_UDP))
 				if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.src_port == usport) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == udport)) {
-					CURRULE.lastseen = CURRENT_TIME;
+					CURRULE.lastseen = THE_CURRENT_TIME;
 					return NF_ACCEPT;
 				}
 		}
@@ -235,7 +240,7 @@ static unsigned int moduleHook(unsigned int hooknum,
 				if ((CURRULE.flags & IRF_SPORTFIRST) && !CURRULE.src_port)
 					if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == udport)) {
 						CURRULE.src_port = usport;
-						CURRULE.lastseen = CURRENT_TIME;
+						CURRULE.lastseen = THE_CURRENT_TIME;
 						return NF_ACCEPT;
 					}
 		}
@@ -249,7 +254,7 @@ static void timerCheckHz(unsigned long u)
 {
 	time_t timeDiff;
 
-	if ((timeDiff = CURRENT_TIME - hz_currentTime) < 1) {
+	if ((timeDiff = THE_CURRENT_TIME - hz_currentTime) < 1) {
     	printk(KERN_WARNING MSGHEADER "Unable to determine kernel HZ. Falling back to %u.\n", (unsigned int) currentHz);
     } else {
 	    unsigned long chz;
@@ -268,7 +273,7 @@ static void timerCheck(unsigned long unused)
 
 	for(i=0; i<maxrules; ++i)
 		if ((CURRULE.flags & IRF_ENABLED) && !(CURRULE.flags & IRF_PERMANENT))
-			if ((CURRENT_TIME - ruletimeout) > CURRULE.lastseen)
+			if ((THE_CURRENT_TIME - ruletimeout) > CURRULE.lastseen)
 				ctlRule(i, CTL_TIMEDOUT);
 //				CURRULE.flags &= ~IRF_ENABLED;
 
@@ -282,29 +287,31 @@ static void timerCheck(unsigned long unused)
 static void ctlRule(int ruleNum, int whattodo)
 {
 	if ((whattodo == CTL_DISABLE) || (whattodo == CTL_TIMEDOUT)) {
-#ifdef DEBUG
-		printk(KERN_DEBUG "cifdebug - ctlRule was called with ruleNum=%i and whattodo=%i.\n", ruleNum, whattodo);
-#endif
+		if (debugmode) {
+			printk(KERN_DEBUG "cifdebug - ctlRule was called with ruleNum=%i and whattodo=%i.\n", ruleNum, whattodo);
+		}
+		
 		if (iprules[ruleNum].flags & IRF_ENABLED) {
-#ifdef DEBUG
-			if (whattodo == CTL_DISABLE) {
-				printk(KERN_DEBUG "cifdebug - Rule #%u was disabled at now=%u.\n", ruleNum, (unsigned int) CURRENT_TIME);
-			} else if (whattodo == CTL_TIMEDOUT) {
-				printk(KERN_DEBUG "cifdebug - Rule #%u timed out at now=%u.\n", ruleNum, (unsigned int) CURRENT_TIME);
+			if (debugmode) {
+				if (whattodo == CTL_DISABLE) {
+					printk(KERN_DEBUG "cifdebug - Rule #%u was disabled at now=%u.\n", ruleNum, (unsigned int) THE_CURRENT_TIME);
+				} else if (whattodo == CTL_TIMEDOUT) {
+					printk(KERN_DEBUG "cifdebug - Rule #%u timed out at now=%u.\n", ruleNum, (unsigned int) THE_CURRENT_TIME);
+				}
+			
+				printk(KERN_DEBUG "cifdebug - Rule stats were:: flags=0x%02x src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u fseen=%u lseen=%u prt=%u id=%u\n",
+					iprules[ruleNum].flags, NIPQUAD(iprules[ruleNum].src_ip), iprules[ruleNum].src_port, NIPQUAD(iprules[ruleNum].dst_ip), iprules[ruleNum].dst_port, (unsigned int) iprules[ruleNum].firstseen, (unsigned int) iprules[ruleNum].lastseen, iprules[ruleNum].protocol, iprules[ruleNum].rule_id);
 			}
 			
-			printk(KERN_DEBUG "cifdebug - Rule stats were:: flags=0x%02x src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u fseen=%u lseen=%u prt=%u id=%u\n",
-				iprules[ruleNum].flags, NIPQUAD(iprules[ruleNum].src_ip), iprules[ruleNum].src_port, NIPQUAD(iprules[ruleNum].dst_ip), iprules[ruleNum].dst_port, (unsigned int) iprules[ruleNum].firstseen, (unsigned int) iprules[ruleNum].lastseen, iprules[ruleNum].protocol, iprules[ruleNum].rule_id);
-#endif
 			/* rule id - conn. time - dest ip:dest port - protocol */
-			printk(KERN_NOTICE "cifiplog - %u %u %u.%u.%u.%u:%u %s now=%u\n", iprules[ruleNum].rule_id, (unsigned int) (iprules[ruleNum].lastseen - iprules[ruleNum].firstseen), NIPQUAD(iprules[ruleNum].dst_ip), iprules[ruleNum].dst_port, ((iprules[ruleNum].protocol == KPROTOCOL_TCP)?"TCP":((iprules[ruleNum].protocol == KPROTOCOL_UDP)?"UDP":"N/A")), (unsigned int) CURRENT_TIME);
+			printk(KERN_NOTICE "cifiplog - %u %u %u.%u.%u.%u:%u %s now=%u\n", iprules[ruleNum].rule_id, (unsigned int) (iprules[ruleNum].lastseen - iprules[ruleNum].firstseen), NIPQUAD(iprules[ruleNum].dst_ip), iprules[ruleNum].dst_port, ((iprules[ruleNum].protocol == KPROTOCOL_TCP)?"TCP":((iprules[ruleNum].protocol == KPROTOCOL_UDP)?"UDP":"N/A")), (unsigned int) THE_CURRENT_TIME);
 			iprules[ruleNum].flags &= ~IRF_ENABLED;
 		}
 	}
 }
 
 
-static int module_proc_read(char *page, char **start, off_t off, int count, int *eof, void *data)
+static int proc_control_read(char *page, char **start, off_t off, int count, int *eof, void *data)
 {
 	register int i;
 	char ips[16], ipd[16];
@@ -334,13 +341,13 @@ static int module_proc_read(char *page, char **start, off_t off, int count, int 
 
 			if (CURRULE.flags & IRF_PERMANENT)
 				len += sprintf(page+len, "\033[1;37m");
-
+				
 			if ((CURRULE.flags & IRF_SPORTFIRST) && !CURRULE.src_port) {
-				len += sprintf(page+len, " %3u   %15s       *   %15s   %5u   %10u   %s   %10u\n", i, ips, ipd, CURRULE.dst_port, CURRULE.rule_id, protoname, (unsigned int) (CURRENT_TIME - CURRULE.lastseen));
+				len += sprintf(page+len, " %3u   %15s       *   %15s   %5u   %10u   %s   %10u\n", i, ips, ipd, CURRULE.dst_port, CURRULE.rule_id, protoname, (unsigned int) (THE_CURRENT_TIME - CURRULE.lastseen));
 			} else if (CURRULE.flags & IRF_SPORTANY) {
-				len += sprintf(page+len, " %3u   %15s   -ANY-   %15s   %5u   %10u   %s   %10u\n", i, ips, ipd, CURRULE.dst_port, CURRULE.rule_id, protoname, (unsigned int) (CURRENT_TIME - CURRULE.lastseen));
+				len += sprintf(page+len, " %3u   %15s   -ANY-   %15s   %5u   %10u   %s   %10u\n", i, ips, ipd, CURRULE.dst_port, CURRULE.rule_id, protoname, (unsigned int) (THE_CURRENT_TIME - CURRULE.lastseen));
 			} else {
-				len += sprintf(page+len, " %3u   %15s   %5u   %15s   %5u   %10u   %s   %10u\n", i, ips, CURRULE.src_port, ipd, CURRULE.dst_port, CURRULE.rule_id, protoname, (unsigned int) (CURRENT_TIME - CURRULE.lastseen));
+				len += sprintf(page+len, " %3u   %15s   %5u   %15s   %5u   %10u   %s   %10u\n", i, ips, CURRULE.src_port, ipd, CURRULE.dst_port, CURRULE.rule_id, protoname, (unsigned int) (THE_CURRENT_TIME - CURRULE.lastseen));
 			}
 
 			if (CURRULE.flags & IRF_PERMANENT)
@@ -367,7 +374,7 @@ static int module_proc_read(char *page, char **start, off_t off, int count, int 
 	return ((count < begin+len-off) ? count : begin+len-off);
 }
 
-static int module_proc_write(struct file *file, const char *buffer, unsigned long count, void *data)
+static int proc_control_write(struct file *file, const char *buffer, unsigned long count, void *data)
 {
 	char param[MAXPARAMS][MAXPARAMSIZE];
 	int p, c, b;
@@ -503,9 +510,8 @@ static int module_proc_write(struct file *file, const char *buffer, unsigned lon
 			printk(KERN_WARNING MSGHEADER "Invalid ip ruleid to remove.\n");
 			goto notdone;
 		} else {
-		    if (remove_ip_rule_by_id(c) != 1) {
-			printk(KERN_WARNING MSGHEADER "removeid failed.\n");
-			}
+		    if (remove_ip_rule_by_id(c) != 1)
+				printk(KERN_WARNING MSGHEADER "removeid failed.\n");
 		}
 
 	/* END OF 'removeid' */
@@ -521,11 +527,87 @@ static int module_proc_write(struct file *file, const char *buffer, unsigned lon
 
 	/* END OF 'renewsourceports' */
 
+	} else if ((p == 2) && (kstrimatch(param[0], "debug"))) {
+		if (kstrimatch(param[1], "on")) {
+			printk(KERN_NOTICE MSGHEADER "entering debug mode.\n");
+			debugmode = 1;
+		} else if (kstrimatch(param[1], "off")) {
+			printk(KERN_NOTICE MSGHEADER "exiting debug mode.\n");
+			debugmode = 0;
+		}
+
+	/* END OF 'debug' */
+	
 	}
 
 	notdone:
 
 	return count;
+}
+
+static int proc_export_read(char *page, char **start, off_t off, int count, int *eof, void *data)
+{
+	register int i;
+	char portanza[6];
+	char protoname[4];
+	int len = 0;
+	off_t begin = 0;
+
+	for(i=0; i<maxrules; ++i) {
+		if (CURRULE.flags & IRF_ENABLED) {
+			
+			if (CURRULE.flags & IRF_SPORTANY)
+				if (CURRULE.flags & IRF_PERMANENT)
+					sprintf(portanza, "!");
+				else
+					sprintf(portanza, "?");
+			else if (CURRULE.flags & IRF_SPORTFIRST)
+				sprintf(portanza, "*");
+			else
+				sprintf(portanza, "%u", CURRULE.src_port);
+			
+			if (CURRULE.protocol == KPROTOCOL_TCP) {
+				sprintf(protoname, "tcp");
+			} else if (CURRULE.protocol == KPROTOCOL_UDP) {
+				sprintf(protoname, "udp");
+			} else {
+				sprintf(protoname, "???");
+			}
+			
+			len += sprintf(page+len, "addip %u.%u.%u.%u %s %u.%u.%u.%u %u %s %u\n", NIPQUAD(CURRULE.src_ip), portanza, NIPQUAD(CURRULE.dst_ip), CURRULE.dst_port, protoname, CURRULE.rule_id);
+		}
+		
+		if (len+begin > off+count)
+			break;
+
+		if (len+begin < off) {
+			begin += len;
+			len = 0;
+		}
+	}
+
+	for(i=0; i<maxports; ++i) {
+		if (CURPORT.flags & PRF_ENABLED)
+			len += sprintf(page+len, "addport %u %u.%u.%u.%u\n", CURPORT.port, NIPQUAD(CURPORT.ip));
+
+		if (len+begin > off+count)
+			break;
+
+		if (len+begin < off) {
+			begin += len;
+			len = 0;
+		}
+	}
+	
+	if (i == maxports)
+		*eof = 1;
+
+	if (off >= len+begin)
+		return 0;
+
+	*start = page + (off-begin);
+
+	return ((count < begin+len-off) ? count : begin+len-off);
 }
 
 static int match_port_rule(__u16 port, __u32 ip)
@@ -578,10 +660,10 @@ static int add_ip_rule(__u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_por
 {
 	register int i;
 
-#ifdef DEBUG
+	if (debugmode) {
 		printk(KERN_DEBUG "cifdebug - Adding rule with:: src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u prt=%u id=%u flags=0x%02x\n",
 			NIPQUAD(src_ip), src_port, NIPQUAD(dst_ip), dst_port, protocol, rule_id, flags);
-#endif
+	}
 	
 	for(i=0; i<maxrules; ++i)
 		if (CURRULE.flags & IRF_ENABLED)
@@ -602,7 +684,7 @@ static int add_ip_rule(__u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_por
 			CURRULE.src_port = src_port;
 			CURRULE.dst_port = dst_port;
 			CURRULE.rule_id = rule_id;
-			CURRULE.firstseen = CURRULE.lastseen = CURRENT_TIME;
+			CURRULE.firstseen = CURRULE.lastseen = THE_CURRENT_TIME;
 			CURRULE.protocol = protocol;
 			CURRULE.flags = IRF_ENABLED | flags;
 			return i;
@@ -654,6 +736,8 @@ static int __init moduleInit(void)
 {
 	printk(KERN_NOTICE MSGHEADER "called.\n");
 
+	debugmode = 0;
+	
 	/* Parameter checking */
 	if ((maxports < PORTS_MIN) || (maxports > PORTS_MAX)) {
 		printk(KERN_ERR MSGHEADER "Invalid number of maximum watch ports 'maxports=%u'!\n", maxports);
@@ -682,21 +766,28 @@ static int __init moduleInit(void)
 		iprules[i].flags &= ~IRF_ENABLED;
 
 	/* Create /proc file for communications */
-	if ((procfile = create_proc_entry(PROCFILENAME, S_IFREG | S_IRUSR | S_IWUSR, &proc_root)) == NULL) {
+	if ((controlfile = create_proc_entry(CONTROLFILENAME, S_IFREG | S_IRUSR | S_IWUSR, &proc_root)) == NULL) {
 		printk(KERN_ERR MSGHEADER "Unable to create communications file.\n");
 		return -6;
 	}
+	
+	if ((exportfile = create_proc_entry(EXPORTFILENAME, S_IFREG | S_IRUSR, &proc_root)) == NULL) {
+		printk(KERN_ERR MSGHEADER "Unable to create export file.\n");
+		return -7;
+	}
 
-	/* Modify /proc file */
-	procfile->size = 666; /* Please kill me prior to changing this */
-	procfile->read_proc = module_proc_read;
-	procfile->write_proc = module_proc_write;
+	/* Modify /proc files */
+	controlfile->size = 666; /* Please kill me prior to changing this */
+	controlfile->read_proc = proc_control_read;
+	controlfile->write_proc = proc_control_write;
+	exportfile->size = 0;
+	exportfile->read_proc = proc_export_read;
 
 	/* Initialize the timer to determine HZ - HZCHECK */
 	init_timer(&timerHz);
 	timerHz.expires = jiffies+(HZCHECKSECS*HZ);
  	timerHz.function = timerCheckHz;
-	hz_currentTime = CURRENT_TIME;
+	hz_currentTime = THE_CURRENT_TIME;
  	add_timer(&timerHz);
 
 	/* Initialize timer */
@@ -710,7 +801,7 @@ static int __init moduleInit(void)
 		printk(KERN_ERR MSGHEADER "Unable to hook IP input!\n");
 		return -1;
 	} else {
-		printk(KERN_INFO MSGHEADER "Hooked IP input with %u ports, %u rules and with %u seconds of timeout.\n", maxports, maxrules, ruletimeout);
+		printk(KERN_INFO MSGHEADER "Hooked IP input with %u ports, %u rules and %u seconds of timeout.\n", maxports, maxrules, ruletimeout);
 	}
 
 	printk(KERN_NOTICE MSGHEADER VERSIONINFO " running.\n");
@@ -725,7 +816,8 @@ static void __exit moduleExit(void)
 	del_timer_sync(&timerHz); /* HZCHECK */
 	del_timer_sync(&timerEntry);
 	nf_unregister_hook(&hookops);
-	remove_proc_entry(PROCFILENAME, &proc_root);
+	remove_proc_entry(CONTROLFILENAME, &proc_root);
+	remove_proc_entry(EXPORTFILENAME, &proc_root);
 
 	/* Kill all rules and update connection times */
 	register int i;
