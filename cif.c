@@ -1,3 +1,5 @@
+/* CIF v1.23 - Configurable IP Filter - 20040721 */
+
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/netfilter_ipv4.h>
@@ -15,7 +17,7 @@
 //#define KBUILD_MODNAME	cif
 
 /* Version Info */
-#define VERSION		"1.21"
+#define VERSION		"1.23"
 #define VERSIONINFO	"CIF v" VERSION " - Build " __TIME__ " " __DATE__
 
 /* Time update frequency, doh */
@@ -26,6 +28,7 @@
 
 /* Various strings */
 #define MSGHEADER		"cif - "
+#define DEBUGMSGHEADER	"cifdebug - "
 #define CONTROLFILENAME	"aibgrebulon"
 #define EXPORTFILENAME	"cif_export"
 
@@ -81,9 +84,9 @@ static int proc_export_read(char *page, char **start, off_t off, int count, int 
 static int match_port_rule(__u16 port, __u32 ip);
 static int add_port_rule(__u16 port, __u32 ip);
 static int remove_port_rule(__u16 port, __u32 ip);
-static int add_ip_rule(__u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_port, __u8 flags, __u16 rule_id, __u8 protocol);
+static int add_ip_rule(__u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_port, __u8 flags, __u32 rule_id, __u8 protocol);
 //static int remove_ip_rule(__u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_port, __u8 protocol);
-static int remove_ip_rule_by_id(__u16 rule_id);
+static int remove_ip_rule_by_id(__u32 rule_id);
 static int kstrimatch(char *x, char *y);
 static int moduleInit(void) __init;
 static void moduleExit(void) __exit;
@@ -105,7 +108,7 @@ typedef struct {
 	time_t	lastseen;
 
 	__u8	protocol;
-	__u16	rule_id;
+	__u32	rule_id;
 } IPRule;
 
 /* Port Rule Format */
@@ -288,21 +291,21 @@ static void ctlRule(int ruleNum, int whattodo)
 {
 	if ((whattodo == CTL_DISABLE) || (whattodo == CTL_TIMEDOUT)) {
 		if (debugmode) {
-			printk(KERN_DEBUG "cifdebug - ctlRule was called with ruleNum=%i and whattodo=%i.\n", ruleNum, whattodo);
+			printk(KERN_DEBUG DEBUGMSGHEADER "ctlRule was called with ruleNum=%i and whattodo=%i.\n", ruleNum, whattodo);
 		}
-		
+
 		if (iprules[ruleNum].flags & IRF_ENABLED) {
 			if (debugmode) {
 				if (whattodo == CTL_DISABLE) {
-					printk(KERN_DEBUG "cifdebug - Rule #%u was disabled at now=%u.\n", ruleNum, (unsigned int) THE_CURRENT_TIME);
+					printk(KERN_DEBUG DEBUGMSGHEADER "Rule #%u was disabled at now=%u.\n", ruleNum, (unsigned int) THE_CURRENT_TIME);
 				} else if (whattodo == CTL_TIMEDOUT) {
-					printk(KERN_DEBUG "cifdebug - Rule #%u timed out at now=%u.\n", ruleNum, (unsigned int) THE_CURRENT_TIME);
+					printk(KERN_DEBUG DEBUGMSGHEADER "Rule #%u timed out at now=%u.\n", ruleNum, (unsigned int) THE_CURRENT_TIME);
 				}
-			
-				printk(KERN_DEBUG "cifdebug - Rule stats were:: flags=0x%02x src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u fseen=%u lseen=%u prt=%u id=%u\n",
+
+				printk(KERN_DEBUG DEBUGMSGHEADER "Rule stats were:: flags=0x%02x src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u fseen=%u lseen=%u prt=%u id=%u\n",
 					iprules[ruleNum].flags, NIPQUAD(iprules[ruleNum].src_ip), iprules[ruleNum].src_port, NIPQUAD(iprules[ruleNum].dst_ip), iprules[ruleNum].dst_port, (unsigned int) iprules[ruleNum].firstseen, (unsigned int) iprules[ruleNum].lastseen, iprules[ruleNum].protocol, iprules[ruleNum].rule_id);
 			}
-			
+
 			/* rule id - conn. time - dest ip:dest port - protocol */
 			printk(KERN_NOTICE "cifiplog - %u %u %u.%u.%u.%u:%u %s now=%u\n", iprules[ruleNum].rule_id, (unsigned int) (iprules[ruleNum].lastseen - iprules[ruleNum].firstseen), NIPQUAD(iprules[ruleNum].dst_ip), iprules[ruleNum].dst_port, ((iprules[ruleNum].protocol == KPROTOCOL_TCP)?"TCP":((iprules[ruleNum].protocol == KPROTOCOL_UDP)?"UDP":"N/A")), (unsigned int) THE_CURRENT_TIME);
 			iprules[ruleNum].flags &= ~IRF_ENABLED;
@@ -341,7 +344,7 @@ static int proc_control_read(char *page, char **start, off_t off, int count, int
 
 			if (CURRULE.flags & IRF_PERMANENT)
 				len += sprintf(page+len, "\033[1;37m");
-				
+
 			if ((CURRULE.flags & IRF_SPORTFIRST) && !CURRULE.src_port) {
 				len += sprintf(page+len, " %3u   %15s       *   %15s   %5u   %10u   %s   %10u\n", i, ips, ipd, CURRULE.dst_port, CURRULE.rule_id, protoname, (unsigned int) (THE_CURRENT_TIME - CURRULE.lastseen));
 			} else if (CURRULE.flags & IRF_SPORTANY) {
@@ -400,7 +403,8 @@ static int proc_control_write(struct file *file, const char *buffer, unsigned lo
 	if ((p == 7) && ((opt_add = kstrimatch(param[0], "addip")))) {
 		unsigned int a1,a2,a3,a4;
 		__u32 sip, dip;
-		__u16 sport, dport, rule_id;
+		__u16 sport, dport;
+		__u32 rule_id;
 		__u8 flags = 0x00; /* adettendir */
 		__u8 protocol;
 
@@ -519,7 +523,7 @@ static int proc_control_write(struct file *file, const char *buffer, unsigned lo
 	} else if ((p == 1) && (kstrimatch(param[0], "renewsourceports"))) {
 		register int i;
 
-		printk(KERN_INFO "renewing source ports.\n");
+		printk(KERN_INFO MSGHEADER "renewing source ports.\n");
 
 		for(i=0; i<maxrules; ++i)
 			if ((CURRULE.flags & IRF_ENABLED) && (CURRULE.flags & IRF_SPORTFIRST))
@@ -537,7 +541,7 @@ static int proc_control_write(struct file *file, const char *buffer, unsigned lo
 		}
 
 	/* END OF 'debug' */
-	
+
 	}
 
 	notdone:
@@ -555,7 +559,7 @@ static int proc_export_read(char *page, char **start, off_t off, int count, int 
 
 	for(i=0; i<maxrules; ++i) {
 		if (CURRULE.flags & IRF_ENABLED) {
-			
+
 			if (CURRULE.flags & IRF_SPORTANY)
 				if (CURRULE.flags & IRF_PERMANENT)
 					sprintf(portanza, "!");
@@ -565,7 +569,7 @@ static int proc_export_read(char *page, char **start, off_t off, int count, int 
 				sprintf(portanza, "*");
 			else
 				sprintf(portanza, "%u", CURRULE.src_port);
-			
+
 			if (CURRULE.protocol == KPROTOCOL_TCP) {
 				sprintf(protoname, "tcp");
 			} else if (CURRULE.protocol == KPROTOCOL_UDP) {
@@ -573,10 +577,10 @@ static int proc_export_read(char *page, char **start, off_t off, int count, int 
 			} else {
 				sprintf(protoname, "???");
 			}
-			
+
 			len += sprintf(page+len, "addip %u.%u.%u.%u %s %u.%u.%u.%u %u %s %u\n", NIPQUAD(CURRULE.src_ip), portanza, NIPQUAD(CURRULE.dst_ip), CURRULE.dst_port, protoname, CURRULE.rule_id);
 		}
-		
+
 		if (len+begin > off+count)
 			break;
 
@@ -598,7 +602,7 @@ static int proc_export_read(char *page, char **start, off_t off, int count, int 
 			len = 0;
 		}
 	}
-	
+
 	if (i == maxports)
 		*eof = 1;
 
@@ -656,15 +660,15 @@ static int remove_port_rule(__u16 port, __u32 ip)
 	return 0;
 }
 
-static int add_ip_rule(__u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_port, __u8 flags, __u16 rule_id, __u8 protocol)
+static int add_ip_rule(__u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_port, __u8 flags, __u32 rule_id, __u8 protocol)
 {
 	register int i;
 
 	if (debugmode) {
-		printk(KERN_DEBUG "cifdebug - Adding rule with:: src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u prt=%u id=%u flags=0x%02x\n",
+		printk(KERN_DEBUG DEBUGMSGHEADER "Adding rule with:: src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u prt=%u id=%u flags=0x%02x\n",
 			NIPQUAD(src_ip), src_port, NIPQUAD(dst_ip), dst_port, protocol, rule_id, flags);
 	}
-	
+
 	for(i=0; i<maxrules; ++i)
 		if (CURRULE.flags & IRF_ENABLED)
 			if (
@@ -709,7 +713,7 @@ static int remove_ip_rule(__u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_
 }
 */
 
-static int remove_ip_rule_by_id(__u16 rule_id)
+static int remove_ip_rule_by_id(__u32 rule_id)
 {
 	register int i;
 
@@ -737,7 +741,7 @@ static int __init moduleInit(void)
 	printk(KERN_NOTICE MSGHEADER "called.\n");
 
 	debugmode = 0;
-	
+
 	/* Parameter checking */
 	if ((maxports < PORTS_MIN) || (maxports > PORTS_MAX)) {
 		printk(KERN_ERR MSGHEADER "Invalid number of maximum watch ports 'maxports=%u'!\n", maxports);
@@ -770,7 +774,7 @@ static int __init moduleInit(void)
 		printk(KERN_ERR MSGHEADER "Unable to create communications file.\n");
 		return -6;
 	}
-	
+
 	if ((exportfile = create_proc_entry(EXPORTFILENAME, S_IFREG | S_IRUSR, &proc_root)) == NULL) {
 		printk(KERN_ERR MSGHEADER "Unable to create export file.\n");
 		return -7;
