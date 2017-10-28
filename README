@@ -1,0 +1,7 @@
+CIF - Configurable IP Filter
+
+This is a Linux (2.6, originally 2.4) module written by me circa 2003~2004 to control access to online gaming servers ran by Sanane/AvaTurk/Oynasana.
+
+It features port-latching rules, rule expiration and time reporting.
+
+It is my first non-trivial C project, my first Linux program and my first kernel module, developed for the first assignment of my first job.
