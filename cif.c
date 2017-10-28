@@ -16,7 +16,7 @@
 #endif
 
 /* Version Info */
-#define VERSION		"1.10" DVERSTR
+#define VERSION		"1.11" DVERSTR
 #define VERSIONINFO	"CIF v" VERSION " - " DBUILDSTR "Build " __TIME__ " " __DATE__
 
 /* Time update frequency, doh */
@@ -179,59 +179,68 @@ static unsigned int moduleHook(unsigned int hooknum,
 
 		register int i;
 
-		for(i=0; i<maxrules; ++i) {
-			if ((CURRULE.flags & IRF_ENABLED) && (CURRULE.protocol == KPROTOCOL_TCP)) {
-				if ((CURRULE.flags & IRF_SPORTFIRST) && !CURRULE.src_port) {
+		for(i=0; i<maxrules; ++i) { /* Loop 1: See if an SPORT-ANY rule exists */
+			if ((CURRULE.flags & IRF_ENABLED) && (CURRULE.protocol == KPROTOCOL_TCP))
+				if (CURRULE.flags & IRF_SPORTANY)
 					if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == tdport)) {
-//						CURRULE.flags &= ~IRF_SPORTFIRST;
+						CURRULE.lastseen = CURRENT_TIME;
+						return NF_ACCEPT;
+					}
+		}
+
+		for(i=0; i<maxrules; ++i) { /* Loop 2: See if a latched rule exists */
+			if ((CURRULE.flags & IRF_ENABLED) && (CURRULE.protocol == KPROTOCOL_TCP))
+				if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.src_port == tsport) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == tdport)) {
+					CURRULE.lastseen = CURRENT_TIME;
+					return NF_ACCEPT;
+				}
+		}
+
+		for(i=0; i<maxrules; ++i) { /* Loop 3: See if a new SPORT-FIRST rule exists */
+			if ((CURRULE.flags & IRF_ENABLED) && (CURRULE.protocol == KPROTOCOL_TCP))
+				if ((CURRULE.flags & IRF_SPORTFIRST) && !CURRULE.src_port)
+					if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == tdport)) {
 						CURRULE.src_port = tsport;
 						CURRULE.lastseen = CURRENT_TIME;
 						return NF_ACCEPT;
 					}
-				} else if (CURRULE.flags & IRF_SPORTANY) {
-					if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == tdport)) {
-						CURRULE.lastseen = CURRENT_TIME;
-						return NF_ACCEPT;
-					}
-				} else {
-					if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.src_port == tsport) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == tdport)) {
-						CURRULE.lastseen = CURRENT_TIME;
-						return NF_ACCEPT;
-					}
-				}
-			}
 		}
 
-		return NF_DROP;
+		return NF_DROP; /* We are out of options */
+
 	} else { /* UDP */
 		if (!match_port_rule(udport, IPH->daddr)) return NF_ACCEPT; /* I am not watching the port */
 
 		register int i;
 
-		for(i=0; i<maxrules; ++i) {
-			if ((CURRULE.flags & IRF_ENABLED) && (CURRULE.protocol == KPROTOCOL_UDP)) {
-				if ((CURRULE.flags & IRF_SPORTFIRST) && !CURRULE.src_port) {
+		for(i=0; i<maxrules; ++i) { /* Loop 1: See if an SPORT-ANY rule exists */
+			if ((CURRULE.flags & IRF_ENABLED) && (CURRULE.protocol == KPROTOCOL_UDP))
+				if (CURRULE.flags & IRF_SPORTANY)
 					if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == udport)) {
-//						CURRULE.flags &= ~IRF_SPORTFIRST;
+						CURRULE.lastseen = CURRENT_TIME;
+						return NF_ACCEPT;
+					}
+		}
+
+		for(i=0; i<maxrules; ++i) { /* Loop 2: See if a latched rule exists */
+			if ((CURRULE.flags & IRF_ENABLED) && (CURRULE.protocol == KPROTOCOL_UDP))
+				if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.src_port == usport) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == udport)) {
+					CURRULE.lastseen = CURRENT_TIME;
+					return NF_ACCEPT;
+				}
+		}
+
+		for(i=0; i<maxrules; ++i) { /* Loop 3: See if a new SPORT-FIRST rule exists */
+			if ((CURRULE.flags & IRF_ENABLED) && (CURRULE.protocol == KPROTOCOL_UDP))
+				if ((CURRULE.flags & IRF_SPORTFIRST) && !CURRULE.src_port)
+					if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == udport)) {
 						CURRULE.src_port = usport;
 						CURRULE.lastseen = CURRENT_TIME;
 						return NF_ACCEPT;
 					}
-				} else if (CURRULE.flags & IRF_SPORTANY) {
-					if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == udport)) {
-						CURRULE.lastseen = CURRENT_TIME;
-						return NF_ACCEPT;
-					}
-				} else {
-					if ((CURRULE.src_ip == IPH->saddr) && (CURRULE.src_port == usport) && (CURRULE.dst_ip == IPH->daddr) && (CURRULE.dst_port == udport)) {
-						CURRULE.lastseen = CURRENT_TIME;
-						return NF_ACCEPT;
-					}
-				}
-			}
 		}
 
-		return NF_DROP;
+		return NF_DROP; /* We are out of options */
 	}
 }
 
